@@ -1,11 +1,16 @@
 import ast
 import copy
+import shutil
+import sys
+import tempfile
+import types
 import uuid
 import platform
 import warnings
 import os.path as osp
 
 from addict import Dict
+from pathlib import Path
 from argparse import Action
 from importlib import import_module
 
@@ -37,7 +42,7 @@ def import_modules_from_strings(imports, allow_failed_imports=False):
             imported_tmp = import_module(imp)
         except ImportError:
             if allow_failed_imports:
-                warnings.warn(f'failed to import {img}', UserWarning)
+                warnings.warn(f'failed to import {imp}', UserWarning)
                 imported_tmp = None
             else:
                 raise ImportError
@@ -231,6 +236,170 @@ class Config:
                 new_v = new_v[new_k]
             cfg = new_v
         return cfg
+
+    @staticmethod
+    def _merge_a_into_b(a, b, allow_list_keys=False):
+        """
+
+        Args:
+            a (dict): The source dict to be merged into ``b``.
+            b (dict): The origin dict to be fetch keys from ``a``.
+            allow_list_keys (bool): If True, int string keys (e.g. '0', '1')
+              are allowed in source ``a`` and will replace the element of the
+              corresponding index in b if b is a list. Default: False.
+
+        Examples:
+            # Normally merge a into b.
+            >>> Config._merge_a_into_b(
+            ...     dict(obj=dict(a=2)), dict(obj=dict(a=1)))
+            {'obj': {'a': 2}}
+
+            # Delete b first and merge a into b.
+            >>> Config._merge_a_into_b(
+            ...     dict(obj=dict(_delete_=True, a=2)), dict(obj=dict(a=1)))
+            {'obj': {'a': 2}}
+
+            # b is a list
+            >>> Config._merge_a_into_b(
+            ...     {'0': dict(a=2)}, [dict(a=1), dict(b=2)], True)
+            [{'a': 2}, {'b': 2}]
+        """
+        b = b.copy()
+        for k, v in a.items():
+            if allow_list_keys and k.isdigit() and isinstance(b, list):
+                k = int(k)
+                if len(b) < k:
+                    raise KeyError(f'Index {k} must be ge len(b).')
+                b[k] = Config._merge_a_into_b(v, b[k], allow_list_keys)
+            elif isinstance(v, dict):
+                if k and b and not v.pop(DELETE_KEY, False):
+                    allowed_types = (dict, list) if allow_list_keys else dict
+                    if not isinstance(b[k], allowed_types):
+                        raise TypeError(
+                            f'{k}={v} in child config cannot inherit from '
+                            f'base because {k} is a dict in the child config '
+                            f'but is of type {type(b[k])} in base config. '
+                            f'You may set `{DELETE_KEY}=True` to ignore the '
+                            f'base config.')
+                    else:
+                        b[k] = Config._merge_a_into_b(v, b[k], allow_list_keys)
+                else:
+                    b[k] = ConfigDict(v)
+            else:
+                b[k] = v
+        return b
+
+    @staticmethod
+    def _file2dict(filename, use_predefined_variables=True):
+        filename = osp.abspath(osp.expanduser(filename))
+        check_file_exist(filename)
+        fileExtname = osp.splitext(filename)[1]
+        if fileExtname not in ['.py', '.json', '.yaml', '.yml']:
+            raise OSError('Only support py/yaml/yml/json.')
+
+        with tempfile.TemporaryDirectory() as temp_config_dir:
+            temp_config_file = tempfile.NamedTemporaryFile(
+                dir=temp_config_dir, suffix=fileExtname
+            )
+            if platform.system() == 'Windows':
+                temp_config_file.close()
+            temp_config_name = osp.basename(temp_config_file.name)
+            # Substitue predefined variables
+            if use_predefined_variables:
+                Config._substitute_predefined_vars(filename,
+                                                   temp_config_file.name)
+            else:
+                shutil.copyfile(filename, temp_config_file.name)
+            # Substitue base variables from placeholders to strings
+            base_var_dict = Config._pre_substitute_base_vars(
+                temp_config_file.name, temp_config_file.name
+            )
+
+            if filename.endswith('.py'):
+                temp_module_name = osp.splitext(temp_config_name)[0]
+                sys.path.insert(0, temp_config_dir)
+                Config._validata_py_syntax(temp_module_name)
+                mod = import_module(temp_module_name)
+                sys.path.pop(0)
+                cfg_dict = {
+                    name: value
+                    for name, value in mod.__dict__.items()
+                    if not name.startswith('__')
+                    and not isinstance(value, types.ModuleType)
+                    and not isinstance(value, types.FunctionType)
+                }
+                # delete imported module
+                del sys.modules[temp_module_name]
+            elif filename.endswith(('.yml', '.yaml', '.json')):
+                raise NotImplementedError
+            # close temp file
+            temp_config_file.close()
+
+        # check deprecation information
+        """
+        'deprecation information' refers to a message or notification 
+            indicating that a particular feature or functionality 
+            of a software library or API is no longer recommended or supported, 
+            and will likely be removed or replaced in a future version.
+        """
+        if DEPRECATION_KEY in cfg_dict:
+            deprecation_info = cfg_dict.pop(DEPRECATION_KEY)
+            warning_msg = f'The config file {filename} will be deprecated ' \
+                          'in the future.'
+            if 'expected' in deprecation_info:
+                warning_msg += f' Please use {deprecation_info["expected"]} ' \
+                               'instead.'
+            if 'reference' in deprecation_info:
+                warning_msg += ' More information can be found at ' \
+                               f'{deprecation_info["reference"]}'
+            warnings.warn(warning_msg, DeprecationWarning)
+
+        cfg_text = filename + '\n'
+        with open(filename, encoding='utf-8') as f:
+            cfg_text += f.read()
+
+        if BASE_KEY in cfg_text:
+            cfg_dir = osp.dirname(filename)
+            base_filename = cfg_dict.pop(BASE_KEY)
+            base_filename = base_filename if isinstance(
+                base_filename, list) else [base_filename]
+
+            cfg_dict_list = list()
+            cfg_text_list = list()
+            for f in base_filename:
+                _cfg_dict, _cfg_text = Config._file2dict(osp.join(cfg_dir, f))
+                cfg_dict_list.append(_cfg_dict)
+                cfg_text_list.append(_cfg_text)
+
+            """
+            It is not allowed to have the same 'key' in multiple base files, 
+                because it is not known which 'key' is the one to employ.
+            """
+            base_cfg_dict = dict()
+            for c in cfg_dict_list:
+                duplicate_keys = base_cfg_dict.keys() & c.keys()
+                if len(duplicate_keys) > 0:
+                    raise KeyError('Duplicate key is not allowed among bases. '
+                                   f'Duplicate keys: {duplicate_keys}')
+                base_cfg_dict.update(c)
+
+            # Substitute base variables from strings to their actual values
+            cfg_dict = Config._substitute_base_vars(cfg_dict, base_var_dict, base_cfg_dict)
+            base_cfg_dict = Config._merge_a_into_b(cfg_dict, base_cfg_dict)
+            cfg_dict = base_cfg_dict
+
+            # merge cfg_text
+            cfg_text_list.append(cfg_text)
+            cfg_text = '\n'.join(cfg_text_list)
+
+        return cfg_dict, cfg_text
+
+    @staticmethod
+    def fromfile(filename,
+                 use_predefined_vaiables=True,
+                 import_custom_modules=True):
+        if isinstance(filename, Path):
+            filename = str(filename)
 
 
 class DictAction(Action):
