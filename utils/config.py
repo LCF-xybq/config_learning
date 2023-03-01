@@ -1,5 +1,6 @@
 import ast
 import copy
+import os
 import shutil
 import sys
 import tempfile
@@ -11,8 +12,10 @@ import os.path as osp
 
 from addict import Dict
 from pathlib import Path
-from argparse import Action
+from collections import abc
 from importlib import import_module
+from argparse import Action, ArgumentParser
+from yapf.yapflib.yapf_api import FormatCode
 
 
 def import_modules_from_strings(imports, allow_failed_imports=False):
@@ -67,6 +70,25 @@ BASE_KEY = '_base_'
 DELETE_KEY = '_delete_'
 DEPRECATION_KEY = '_deprecation_'
 RESERVED_KEYS = ['filename', 'text', 'pretty_text']
+
+
+def add_args(parser, cfg, prefix=''):
+    for k, v in cfg.items():
+        if isinstance(v, str):
+            parser.add_argument('--' + prefix + k)
+        elif isinstance(v, int):
+            parser.add_argument('--' + prefix + k, type=int)
+        elif isinstance(v, float):
+            parser.add_argument('--' + prefix + k, type=float)
+        elif isinstance(v, bool):
+            parser.add_argument('--' + prefix + k, action='store_true')
+        elif isinstance(v, dict):
+            add_args(parser, v, prefix + k + '.')
+        elif isinstance(v, abc.Iterable):
+            parser.add_argument('--' + prefix + k, type=type(v[0]), nargs='+')
+        else:
+            print(f'cannot parse key {prefix + k} of type {type(v)}')
+    return parser
 
 
 class ConfigDict(Dict):
@@ -400,7 +422,213 @@ class Config:
                  import_custom_modules=True):
         if isinstance(filename, Path):
             filename = str(filename)
+        cfg_dict, cfg_text = Config._file2dict(filename,
+                                               use_predefined_vaiables)
+        if import_custom_modules and cfg_dict.get('custom_imports', None):
+            import_modules_from_strings(**cfg_dict['custom_imports'])
+        return Config(cfg_dict, cfg_text=cfg_text, filename=filename)
 
+    @staticmethod
+    def fromstring(cfg_str, file_format):
+        if file_format not in ['.py', '.json', '.yaml', '.yml']:
+            raise OSError('Only py/yml/yaml/json type are supported now!')
+        if file_format != '.py' and 'dict(' in cfg_str:
+            # check if users specify a wrong suffix for python
+            warnings.warn(
+                'Please check "file_format", the file format may be .py')
+        with tempfile.NamedTemporaryFile(
+            'w', encoding='utf-8',
+                suffix=file_format, delete=False) as temp_file:
+            temp_file.write(cfg_str)
+
+        cfg = Config.fromfile(temp_file.name)
+        os.remove(temp_file.name)
+        return cfg
+
+    @staticmethod
+    def auto_argparser(description=None):
+        partial_parser = ArgumentParser(description=description)
+        partial_parser.add_argument('config', help='config file path')
+        cfg_file = partial_parser.parse_known_args()[0].config
+        cfg = Config.fromfile(cfg_file)
+        parser = ArgumentParser(description=description)
+        parser.add_argument('config', help='config file path')
+        add_args(parser, cfg)
+        return parser, cfg
+
+    def __init__(self, cfg_dict=None, cfg_text=None, filename=None):
+        if cfg_dict in None:
+            cfg_dict = dict()
+        elif not isinstance(cfg_dict, dict):
+            raise TypeError('cfg_dict must be a dict')
+
+        for key in cfg_dict:
+            if key in RESERVED_KEYS:
+                raise KeyError(f'{key} is reserved for config file')
+
+        if isinstance(filename, Path):
+            filename = str(filename)
+
+        super().__setattr__('_cfg_dict', ConfigDict(cfg_dict))
+        super().__setattr__('_filename', filename)
+
+        if cfg_text:
+            text = cfg_text
+        elif filename:
+            with open(filename) as f:
+                text = f.read()
+        else:
+            text = ''
+
+        super().__setattr__('_text', text)
+
+    @property
+    def filename(self):
+        return self._filename
+
+    @property
+    def text(self):
+        return self._text
+
+    @property
+    def pretty_text(self):
+        indent = 4
+
+        def _indent(s_, num_spaces):
+            s = s_.split('\n')
+            if len(s) == 1:
+                return s_
+            first = s.pop(0)
+            s = [(num_spaces * ' ') + line for line in s]
+            s = '\n'.join(s)
+            s = first + '\n' + s
+            return s
+
+        def _format_basic_types(k, v, use_mapping=False):
+            if isinstance(v, str):
+                v_str = f"'{v}'"
+            else:
+                v_str = str(v)
+            if use_mapping:
+                k_str = f"'{k}'" if isinstance(k, str) else str(k)
+                attr_str = f'{k_str}: {v_str}'
+            else:
+                attr_str = f'{str(k)}={v_str}'
+            attr_str = _indent(attr_str, indent)
+
+            return attr_str
+
+        def _format_list(k, v, use_mapping=False):
+            # check if all items in the list are dict
+            if all(isinstance(_, dict) for _ in v):
+                v_str = '[\n'
+                v_str += '\n'.join(
+                    f'dict({_indent(_format_dict(v), indent)}),'
+                    for v_ in v).rstrip(',')
+                if use_mapping:
+                    k_str = f"'{k}'" if isinstance(k, str) else str(k)
+                    attr_str = f'{k_str}: {v_str}'
+                else:
+                    attr_str = f'{str(k)}={v_str}'
+                attr_str = _indent(attr_str, indent) + ']'
+            else:
+                attr_str = _format_basic_types(k, v, use_mapping)
+            return attr_str
+
+        def _contain_invalid_identifier(dict_str):
+            contain_invalid_identifier = False
+            for key_name in dict_str:
+                contain_invalid_identifier |= \
+                    (not str(key_name).isidentifier())
+            return contain_invalid_identifier
+
+        def _format_dict(input_dict, outest_level=False):
+            r = ''
+            s = []
+
+            use_mapping = _contain_invalid_identifier(input_dict)
+            if use_mapping:
+                r += '{'
+            for idx, (k, v) in enumerate(input_dict.items()):
+                is_last = idx >= len(input_dict) - 1
+                end = '' if outest_level or is_last else ','
+                if isinstance(v, dict):
+                    v_str = '\n' + _format_dict(v)
+                    if use_mapping:
+                        k_str = f"'{k}'" if isinstance(k, str) else str(k)
+                        attr_str = f'{k_str}: dict{v_str}'
+                    else:
+                        attr_str = f'{str(k)}=dict({v_str}'
+                    attr_str = _indent(attr_str, indent) + ')' + end
+                elif isinstance(v, list):
+                    attr_str = _format_list(k, v, use_mapping) + end
+                else:
+                    attr_str = _format_basic_types(k, v, use_mapping) + end
+
+                s.append(attr_str)
+            r += '\n'.join(s)
+            if use_mapping:
+                r += '}'
+            return r
+
+        cfg_dict = self._cfg_dict.to_dict()
+        text = _format_dict(cfg_dict, outest_level=True)
+        yapf_style = dict(
+            based_on_style='pep8',
+            blank_line_before_nested_class_or_def=True,
+            split_before_expression_after_opening_paren=True
+        )
+        text, _ = FormatCode(text, style_config=yapf_style, verify=True)
+
+        return text
+
+    def __repr__(self):
+        return f'Config (path: {self.filename}): {self._cfg_dict.__repr__()}'
+
+    def __len__(self):
+        return len(self._cfg_dict)
+
+    def __getattr__(self, item):
+        return getattr(self._cfg_dict, item)
+
+    def __getitem__(self, item):
+        return self._cfg_dict.__getitem__(item)
+
+    def __setattr__(self, name, value):
+        if isinstance(value, dict):
+            value = ConfigDict(value)
+        self._cfg_dict.__setattr__(name, value)
+
+    def __iter__(self):
+        return iter(self._cfg_dict)
+
+    def __getstate__(self):
+        return (self._cfg_dict, self._filename, self._text)
+
+    def __copy__(self):
+        cls = self.__class__
+        other = cls.__new__(cls)
+        other.__dict__.update(self.__dict__)
+        return other
+
+    def __deepcopy__(self, memodict={}):
+        cls = self.__class__
+        other = cls.__new__(cls)
+        memodict[id(self)] = other
+
+        for key, value in self.__dict__.items():
+            super(Config, other).__setattr__(key, copy.deepcopy(value, memodict))
+
+        return other
+
+    def __setstate__(self, state):
+        _cfg_dict, _filename, _text = state
+        super().__setattr__('_cfg_dict', _cfg_dict)
+        super().__setattr__('_filename', _filename)
+        super().__setattr__('_text', _text)
+
+    def dump(self, file=None):
+        """dump configs to file."""
 
 class DictAction(Action):
     pass
