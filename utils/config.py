@@ -629,6 +629,139 @@ class Config:
 
     def dump(self, file=None):
         """dump configs to file."""
+        import fileio
+        cfg_dict = super().__getattribute__('_cfg_dict').to_dict()
+        if file is None:
+            if self.filename is None or self.filename.endswith('.py'):
+                return self.pretty_text
+            else:
+                file_format = self.filename.split('.')[-1]
+                return fileio.dump(cfg_dict, file_format=file_format)
+        elif file.endswith('.py'):
+            with open(file, 'w', encoding='utf-8') as f:
+                f.write(self.pretty_text)
+        else:
+            file_format = file.split('.')[-1]
+            return fileio.dump(cfg_dict, file=file, file_format=file_format)
+
+    def merge_from_dict(self, options, allow_list_keys=True):
+        """Merge list into cfg_dict.
+
+        Args:
+            options (dict): dict of configs to merge from.
+            allow_list_keys (bool): If True, int string keys (e.g. '0', '1')
+              are allowed in ``options`` and will replace the element of the
+              corresponding index in the config if the config is a list.
+              Default: True.
+        """
+        option_cfg_dict = {}
+        for full_key, v in options.items():
+            d = option_cfg_dict
+            key_list = full_key.split('.')
+            for subkey in key_list[:-1]:
+                d.setdefault(subkey, ConfigDict())
+                d = d[subkey]
+            subkey = key_list[-1]
+            d[subkey] = v
+
+        cfg_dict = super().__getattribute__('_cfg_dict')
+        super().__setattr__(
+            '_cfg_dict',
+            Config._merge_a_into_b(
+                option_cfg_dict, cfg_dict, allow_list_keys=allow_list_keys)
+        )
+
 
 class DictAction(Action):
-    pass
+    """
+    argparse action to split an argument into KEY=VALUE form
+    on the first = and append to a dictionary. List options can
+    be passed as comma separated values, i.e 'KEY=V1,V2,V3', or with explicit
+    brackets, i.e. 'KEY=[V1,V2,V3]'. It also support nested brackets to build
+    list/tuple values. e.g. 'KEY=[(V1,V2),(V3,V4)]'
+    """
+    @staticmethod
+    def _parse_int_float_bool(val):
+        try:
+            return int(val)
+        except ValueError:
+            pass
+        try:
+            return float(val)
+        except ValueError:
+            pass
+        if val.lower() in ['true', 'false']:
+            return True if val.lower() == 'true' else False
+        if val == 'None':
+            return None
+        return val
+
+    @staticmethod
+    def _parse_iterable(val):
+        """Parse iterable values in the string.
+
+        All elements inside '()' or '[]' are treated as iterable values.
+
+        Args:
+            val (str): Value string.
+
+        Returns:
+            list | tuple: The expanded list or tuple from the string.
+
+        Examples:
+            >>> DictAction._parse_iterable('1,2,3')
+            [1, 2, 3]
+            >>> DictAction._parse_iterable('[a, b, c]')
+            ['a', 'b', 'c']
+            >>> DictAction._parse_iterable('[(1, 2, 3), [a, b], c]')
+            [(1, 2, 3), ['a', 'b'], 'c']
+        """
+
+        def find_next_comma(string):
+            """Find the position of next comma in the string.
+
+            If no ',' is found in the string, return the string length. All
+            chars inside '()' and '[]' are treated as one element and thus ','
+            inside these brackets are ignored.
+            """
+            assert (string.count('(') == string.count(')')) and (
+                string.count('[') == string.count(']')), \
+            f'Imbalanced brackets exist in {string}'
+            end = len(string)
+            for idx, char in enumerate(string):
+                pre = string[:idx]
+                # The string before this ',' is balanced
+                if ((char == ',') and (pre.count('(') == pre.count(')'))
+                        and (pre.count('[') == pre.count(']'))):
+                    end = idx
+                    break
+            return end
+
+        # Strip ' and " characters and replace whitespace.
+        val = val.strip('\'\"').replace(' ', '')
+        is_tuple = False
+        if val.startswith('(') and val.endswith(')'):
+            is_tuple = True
+            val = val[1:-1]
+        elif val.startswith('[') and val.endswith(']'):
+            val = val[1:-1]
+        elif ',' not in val:
+            # val is a single value
+            return DictAction._parse_int_float_bool(val)
+
+        values = []
+        while len(val) > 0:
+            comma_idx = find_next_comma(val)
+            element = DictAction._parse_iterable(val[:comma_idx])
+            values.append(element)
+            val = val[comma_idx + 1:]
+        if is_tuple:
+            values = tuple(values)
+        return values
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        options = {}
+        for kv in values:
+            key, val = kv.split('=', maxsplit=1)
+            options[key] = self._parse_iterable(val)
+        setattr(namespace, self.dest, options)
